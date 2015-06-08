@@ -13,7 +13,7 @@ cp debian/control.$UBUNTU_RELEASE.in debian/control.in
 
 VERS=`cat ../../kernel/linux/pf_ring.h | grep RING_VERSION | head -1 | cut -d '"' -f 2`
 MACHINE=`uname -m`
-SVN_RELEASE=`svn info . | grep "^Revision" | cut -d " " -f 2`
+SVN_RELEASE=`git describe | sed 's/^v//g'`
 PFRING_VERS=`cat $HOME/PF_RING/kernel/linux/pf_ring.h | grep RING_VERSION | head -1 | cut -d '"' -f 2`
 
 if test $MACHINE = "x86_64"; then
