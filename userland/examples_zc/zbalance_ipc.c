@@ -44,7 +44,7 @@
 #include "zutils.c"
 
 #define ALARM_SLEEP             1
-#define MAX_CARD_SLOTS      32768
+#define MAX_CARD_SLOTS      32768 //Only true for 10G cards, 4096 for igb/1G. (HW limit)
 #define PREFETCH_BUFFERS        8
 #define QUEUE_LEN            8192
 #define POOL_SIZE              16
@@ -59,12 +59,16 @@ pfring_zc_queue **outzqs;
 pfring_zc_multi_queue *outzmq; /* fanout */
 pfring_zc_buffer_pool *wsp;
 
+u_int32_t alarm_sec_sleep = 1;
 u_int32_t num_devices = 0;
 u_int32_t num_apps = 0;
 u_int32_t num_consumer_queues = 0;
 u_int32_t queue_len = QUEUE_LEN;
 u_int32_t instances_per_app[MAX_NUM_APP];
 char **devices = NULL;
+
+int card_slots = 0;
+int mtu = 0;
 
 int cluster_id = -1;
 int metadata_len = 0;
@@ -254,7 +258,7 @@ void printHelp(void) {
   printf("zbalance_ipc - (C) 2014 ntop.org\n");
   printf("Using PFRING_ZC v.%s\n", pfring_zc_version());
   printf("A master process balancing packets to multiple consumer processes.\n\n");
-  printf("Usage: zbalance_ipc -i <device> -c <cluster id> -n <num inst>\n"
+  printf("Usage: zbalance_ipc -i <device> -c <cluster id> -n <num inst> -M <mtu>\n"
 	 "                [-h] [-m <hash mode>] [-S <core id>] [-g <core_id>]\n"
 	 "                [-N <num>] [-a] [-q <len>] [-Q <sock list>] [-d] \n"
 	 "                [-D <username>] [-P <pid file>] \n\n");
@@ -269,18 +273,229 @@ void printHelp(void) {
          "                1 - IP hash, or TID (thread id) in case of '-i sysdig'\n"
          "                2 - Fan-out\n"
          "                3 - Fan-out (1st) + Round-Robin (2nd, 3rd, ..)\n"
-         "                4 - GTP hash (Inner IP/Port or Seq-Num)\n");
+         "                4 - GTP hash (Inner IP/Port or Seq-Num)\n"
+         "                5 - BAD hash (Not completed): vlan,proto,sip,dip,sport,dport\n"
+         "                6 - Vlan/ethtype/IP hash\n");
+  printf("-M <max MTU>    Size of largest MTU we should handle\n");
+  printf("-C <card slots> 4096 (igb) or 32768(ixgbe), defaults to ixgbe. Accepts any value >= igb\n");
   printf("-S <core id>    Enable Time Pulse thread and bind it to a core\n");
   printf("-g <core_id>    Bind this app to a core\n");
   printf("-q <len>        Number of slots in each queue (default: %u)\n", QUEUE_LEN);
   printf("-N <num>        Producer for n2disk multi-thread (<num> threads)\n");
   printf("-a              Active packet wait\n");
   printf("-Q <sock list>  Enable VM support (comma-separated list of QEMU monitor sockets)\n");
+  printf("-r              Interval for statistics, defaults to 1 sec.\n");
   printf("-p              Print per-interface and per-queue absolute stats\n");
   printf("-d              Daemon mode\n");
   printf("-D <username>   Drop privileges\n");
   printf("-P <pid file>   Write pid to the specified file (daemon mode only)\n");
   exit(-1);
+}
+
+struct compact_eth_hdr {
+  unsigned char   h_dest[ETH_ALEN];
+  unsigned char   h_source[ETH_ALEN];
+  u_int16_t       h_proto;
+};
+
+struct compact_ip_hdr {
+  u_int8_t      ihl:4,
+                version:4;
+  u_int8_t      tos;
+  u_int16_t     tot_len;
+  u_int16_t     id;
+  u_int16_t     frag_off;
+  u_int8_t      ttl;
+  u_int8_t      protocol;
+  u_int16_t     check;
+  u_int32_t     saddr;
+  u_int32_t     daddr;
+};
+
+/*
+struct in6_addr {
+    unsigned char   s6_addr[16];
+};
+*/
+struct compact_ipv6_hdr {
+  u_int8_t              priority:4,
+                        version:4;
+  u_int8_t              flow_lbl[3];
+  u_int16_t             payload_len;
+  u_int8_t              nexthdr;
+  u_int8_t              hop_limit;
+  struct                in6_addr saddr;
+  struct                in6_addr daddr;
+};
+
+struct compact_udp_hdr {
+  u_int16_t       sport;
+  u_int16_t       dport;
+  u_int16_t       len;
+  u_int16_t       check;
+};
+
+/* ***************************************
+ Both ip_vlan_proto_hash and bad_hash look for "all" vlan tags and add them to hash,
+ they also look at the eth_type after that and adds it to hash, this will help a minimal
+ amount but it's "free" so why not. If it's ipv4/6 we also look at source and dest IP address.
+
+ Only bad_hash looks at ports (not for ipv6!) - but do not work with fragmented traffic (yet..)!
+ ip_vlan_proto_hash works OK with fragments.
+   *************************************** */
+
+int32_t ip_vlan_proto_hash(pfring_zc_pkt_buff *pkt_handle, pfring_zc_queue *in_queue, void *user) {
+  long num_out_queues = (long) user;
+  u_int32_t buffer_len = pkt_handle->len;
+
+  u_char *pkt_data = pfring_zc_pkt_buff_data(pkt_handle, in_queue);
+  u_int32_t hash = 0, l3_offset = sizeof(struct compact_eth_hdr);
+
+  u_int16_t eth_type;
+
+  eth_type = (pkt_data[12] << 8) + pkt_data[13];
+  // We could prob unroll this loop, how many vlan tags can you have? QinQinQ seems to be it.
+  //while (eth_type == 0x8100 /* VLAN */ && l3_offset+4 < buffer_len) {
+  while ((eth_type == 0x8100 || eth_type == 0x88a8 || eth_type == 0x9100 || eth_type == 0x9200 || eth_type == 0x9300) && l3_offset+4 < buffer_len) {
+    hash += ((pkt_data[14] << 8) + pkt_data[15]) & 0x0fff;
+    l3_offset += 4;
+    eth_type = (pkt_data[l3_offset - 2] << 8) + pkt_data[l3_offset - 1];
+  }
+
+  hash += eth_type;
+
+  switch (eth_type) {
+  case 0x0800:
+    {
+      /* IPv4 */
+      struct compact_ip_hdr *iph;
+
+      if (unlikely(buffer_len < l3_offset + sizeof(struct compact_ip_hdr)))
+        return hash;
+
+      iph = (struct compact_ip_hdr *) &pkt_data[l3_offset];
+
+      hash += __bswap_32(iph->saddr) + __bswap_32(iph->daddr);
+    }
+    break;
+  case 0x86DD:
+    {
+      /* IPv6 */
+      struct compact_ipv6_hdr *ipv6h;
+      u_int32_t *s, *d;
+
+      if (unlikely(buffer_len < l3_offset + sizeof(struct compact_ipv6_hdr)))
+        return hash;
+
+      ipv6h = (struct compact_ipv6_hdr *) &pkt_data[l3_offset];
+
+      s = (u_int32_t *) &ipv6h->saddr, d = (u_int32_t *) &ipv6h->daddr;
+      hash += s[0] + s[1] + s[2] + s[3] + d[0] + d[1] + d[2] + d[3];
+    }
+    break;
+  default:
+    return hash % num_out_queues;
+  }
+
+  return hash % num_out_queues;
+}
+
+/* *************************************** */
+
+int32_t bad_hash(pfring_zc_pkt_buff *pkt_handle, pfring_zc_queue *in_queue, void *user) {
+  long num_out_queues = (long) user;
+  u_int32_t buffer_len = pkt_handle->len;
+
+  u_char *pkt_data = pfring_zc_pkt_buff_data(pkt_handle, in_queue);
+  u_int32_t hash = 0, l3_offset = sizeof(struct compact_eth_hdr), l4_offset = 0;
+
+  u_int16_t eth_type;
+  u_int8_t l3_proto = 0; /* To remove warnings, is set, and checked against none 0 values so this is OK */
+
+  /* Vlan fiddle info:                   (remember, var eth_type is 16 bits)
+   * u_char = (C99) uint8_t, so pos [12] is shifted 8 bits to the left to remove every thing but TPID,
+   * then pos [13] is added. If it is vlan, then pos [13] will be 0x00 (and [14] will be 0x80)
+   * Ehhh, the vlan jungle...
+   * 0x8100 is 802.1Q, 0x9100 is An old non-standard 802.1QinQ protocol used 0x9100. 802.1QInQ-2007 it seems, 0x88a8 is QinQ (802.1ad)
+   * WHAT THE HELL ... there is more!? 0x9200 is mentioned in cisco doc's, 0x9300 is another ...
+   * Only 0x8100 and 0x88a8 are standardized, the other three are not
+   */
+
+  eth_type = (pkt_data[12] << 8) + pkt_data[13];
+  // We could prob unroll this loop, how many vlan tags can you have? QinQinQ seems to be it.
+  while ((eth_type == 0x8100 || eth_type == 0x88a8 || eth_type == 0x9100 || eth_type == 0x9200 || eth_type == 0x9300) && l3_offset+4 < buffer_len) {
+    hash += ((pkt_data[14] << 8) + pkt_data[15]) & 0x0fff;
+    l3_offset += 4;
+    eth_type = (pkt_data[l3_offset - 2] << 8) + pkt_data[l3_offset - 1];
+  }
+
+  hash += eth_type;
+
+  switch (eth_type) {
+  case 0x0800:
+    {
+      /* IPv4 */
+      struct compact_ip_hdr *iph;
+
+      if (unlikely(buffer_len < l3_offset + sizeof(struct compact_ip_hdr)))
+        return hash;
+
+      iph = (struct compact_ip_hdr *) &pkt_data[l3_offset];
+
+      /* See the next comment, but we can inline this/replace with just a byte swap (big endian/network order VS little endian/intel/our order)
+       * x = (x << 24) | ((x & 0xff00) << 8) | ((x & 0xff0000) >> 8) | (x >> 24);
+       * or
+       * glib's __bswap_32(x) which is __bswap_constant_32(x) which is:
+       * ((((x) & 0xff000000u) >> 24) | (((x) & 0x00ff0000u) >>  8) | (((x) & 0x0000ff00u) <<  8) | (((x) & 0x000000ffu) << 24))
+       * which do the same thing.
+       */
+      //our works, prob no diff vs ntohl as the compiler will take care of it:
+      //hash = ntohl(iph->saddr) + ntohl(iph->daddr); /* this can be optimized by avoiding calls to ntohl(), but it can lead to balancing issues */
+      hash += __bswap_32(iph->saddr) + __bswap_32(iph->daddr);
+
+      l3_proto = iph->protocol;
+      l4_offset = l3_offset + (iph->ihl * 4);
+    }
+    break;
+  case 0x86DD:
+    {
+      /* IPv6 */
+      struct compact_ipv6_hdr *ipv6h;
+      u_int32_t *s, *d;
+
+      if (unlikely(buffer_len < l3_offset + sizeof(struct compact_ipv6_hdr)))
+        return hash;
+
+      ipv6h = (struct compact_ipv6_hdr *) &pkt_data[l3_offset];
+
+      s = (u_int32_t *) &ipv6h->saddr, d = (u_int32_t *) &ipv6h->daddr;
+      hash += s[0] + s[1] + s[2] + s[3] + d[0] + d[1] + d[2] + d[3];
+
+      /* Hmm, does not set l3_proto or l4_offset, "ok" but not complete compared to ipv4
+       * So we cannot hash on proto or ports when we see ipv6 packets
+       * We need to see what the "nextheader" is, look for 6,17 and
+       */
+    }
+    break;
+  default:
+    return hash % num_out_queues;
+  }
+
+  // 6, 17, 132, we could add UDP Lite (136), RUDP/RTP too? (27)
+  if(likely(l3_proto == IPPROTO_TCP || l3_proto == IPPROTO_UDP || l3_proto == IPPROTO_SCTP)) {
+    struct compact_udp_hdr *udph = (struct compact_udp_hdr *)(&pkt_data[l4_offset]);
+    //hash += ntohs(udph->sport) + ntohs(udph->dport);
+    hash += __bswap_16(udph->sport) + __bswap_16(udph->dport);
+  }
+
+  /* Fragments are not handeld at all, this is a bit tricky:
+   * Easy if all fragments come in order, less so if not.
+   * In order, only remember where to send it.
+   * Out of order, buffer until we know where to send.
+   * Static rings etc
+   */
+
+  return hash % num_out_queues;
 }
 
 /* *************************************** */
@@ -401,7 +616,7 @@ int main(int argc, char* argv[]) {
     opt_argv = argv;
   }
 
-  while((c = getopt(opt_argc, opt_argv,"ac:dg:hi:m:n:pQ:q:N:P:S:z")) != '?') {
+  while((c = getopt(opt_argc, opt_argv,"aC:c:dg:hi:M:m:n:pQ:r:q:N:P:S:z")) != '?') {
     if((c == 255) || (c == -1)) break;
 
     switch(c) {
@@ -414,11 +629,17 @@ int main(int argc, char* argv[]) {
     case 'c':
       cluster_id = atoi(optarg);
       break;
+    case 'C':
+      card_slots = atoi(optarg);
+      break;
     case 'd':
       daemon_mode = 1;
       break;
     case 'm':
       hash_mode = atoi(optarg);
+      break;
+    case 'M':
+      mtu = atoi(optarg);
       break;
     case 'n':
       applications = strdup(optarg);
@@ -443,6 +664,9 @@ int main(int argc, char* argv[]) {
       n2disk_producer = 1;
       n2disk_threads = atoi(optarg);
       break;
+    case 'r':
+      alarm_sec_sleep = atoi(optarg);
+      break;
     case 'P':
       pid_file = strdup(optarg);
       break;
@@ -459,6 +683,8 @@ int main(int argc, char* argv[]) {
   if (device == NULL) printHelp();
   if (cluster_id < 0) printHelp();
   if (applications == NULL) printHelp();
+  if (mtu == 0) printHelp();
+  if (card_slots == 0) card_slots = MAX_CARD_SLOTS;
 
   if (n2disk_producer) {
     if (n2disk_threads < 1) printHelp();
@@ -496,9 +722,9 @@ int main(int argc, char* argv[]) {
 
   zc = pfring_zc_create_cluster(
     cluster_id, 
-    max_packet_len(devices[0]),
+    mtu,
     metadata_len,
-    (num_real_devices * MAX_CARD_SLOTS) + (num_in_queues * (queue_len + IN_POOL_SIZE)) 
+    (num_real_devices * card_slots) + (num_in_queues * (queue_len + IN_POOL_SIZE)) 
      + (num_consumer_queues * (queue_len + POOL_SIZE)) + PREFETCH_BUFFERS + num_additional_buffers, 
     numa_node_of_cpu(bind_worker_core),
     NULL /* auto hugetlb mountpoint */ 
@@ -638,7 +864,7 @@ int main(int argc, char* argv[]) {
       trace(TRACE_NORMAL, "\tpfcount -i zc:%d@%lu\n", cluster_id, off++);
   }
 
-  if (hash_mode == 0 || ((hash_mode == 1 || hash_mode == 4) && num_apps == 1)) { /* balancer */
+  if (hash_mode == 0 || hash_mode == 5 || hash_mode == 6 || ((hash_mode == 1 || hash_mode == 4) && num_apps == 1)) { /* balancer */
     pfring_zc_distribution_func func = NULL;
 
     switch (hash_mode) {
@@ -647,6 +873,10 @@ int main(int argc, char* argv[]) {
     case 1: if (strcmp(device, "sysdig") == 0) func = sysdig_distribution_func; else if (time_pulse) func = ip_distribution_func; /* else built-in IP-based */
       break;
     case 4: if (strcmp(device, "sysdig") == 0) func = sysdig_distribution_func; else func =  gtp_distribution_func;
+      break;
+    case 5: func = bad_hash; /* Yes, atm it is */
+      break;
+    case 6: func = ip_vlan_proto_hash;
       break;
     }
 
@@ -706,7 +936,7 @@ int main(int argc, char* argv[]) {
   }
   
   while (!do_shutdown) {
-    sleep(ALARM_SLEEP);
+    sleep(alarm_sec_sleep);
     print_stats();
   }
 
